@@ -13,6 +13,9 @@
 #include <pthread.h>
 #include <time.h>
 #include "errors.h"
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
 
 /*
  * The "alarm" structure now contains the time_t (time since the
@@ -21,15 +24,139 @@
  * enough, since the "alarm thread" cannot tell how long it has
  * been on the list.
  */
+
+typedef enum{
+    ALARM_START,
+    ALARM_CHANGE,
+    ALARM_CANCEL,
+    ALARM_SUSPEND,
+    ALARM_REACTIVATE,
+    ALARM_VIEW,
+} alarm_func_t;
+
+typedef struct {
+    pthread_t thread_id;
+    int alarm_count;
+} display_thread_info_t;
+
+
 typedef struct alarm_tag {
     struct alarm_tag    *link;
     int                 seconds;
     time_t              time;   /* seconds from EPOCH */
-    char                message[64];
+    char                message[128];
+
+    int alarm_id;
+    alarm_func_t func;
+    int status;
+    pthread_t assigned_thread;
+
+    time_t request_time; //Used during time tags printing
 } alarm_t;
+
+
+
+display_thread_info_t display_threads[20]; //Storage for storing the displays
+int display_thread_count = 0; //Display counter since each display has a maximum amount of alarms they can store
 
 pthread_mutex_t alarm_mutex = PTHREAD_MUTEX_INITIALIZER;
 alarm_t *alarm_list = NULL;
+
+void *display_alarm_thread(void *arg) {
+    pthread_t self_id = pthread_self();
+
+    while(1){
+        pthread_mutex_lock(&alarm_mutex);
+
+        alarm_t **prev = &alarm_list;
+        alarm_t *alarm = alarm_list;
+
+        time_t now = time(NULL);
+
+        while(alarm != NULL) {
+            alarm_t *next = alarm->link;
+
+            if(now >= alarm->time) {
+                *prev = alarm->link;
+                free(alarm);
+                alarm = next;
+                continue;
+            }
+
+            prev = &alarm->link;
+            alarm = next;
+        }
+
+        pthread_mutex_unlock(&alarm_mutex);
+
+        sleep(5);
+    }
+    return NULL;
+}
+
+
+void *start_alarm_thread(void *arg){
+    while(1){
+        pthread_mutex_lock(&alarm_mutex);
+
+        alarm_t *alarm = alarm_list;
+
+        while(alarm != NULL){
+            if(alarm->func == ALARM_START && alarm->assigned_thread == 0){ //check if Start_Alarm has not been assigned yet
+
+                pthread_t chosen_thread = 0;
+
+                for(int i = 0; i < display_thread_count; i++){ //check if there are existing displays threads for capacity
+                    
+                    if(display_threads[i].alarm_count < 2){
+                        chosen_thread = display_threads[i].thread_id;
+                        display_threads[i].alarm_count++;
+
+                        break;
+                    }
+                }
+
+                if(chosen_thread == 0){ //Creates a new Display if there are none
+
+                   if(display_thread_count >= 20){
+                        printf("ERROR: No more displays threads available\n");
+
+                   } else {
+
+                        pthread_t new_thread_id;
+                        pthread_create(&new_thread_id, NULL, display_alarm_thread, NULL);
+
+                        printf("New Display Alarm Thread %lu Created at %ld\n", new_thread_id, alarm->request_time);
+                   
+                        display_threads[display_thread_count].thread_id = new_thread_id;
+                        display_threads[display_thread_count].alarm_count = 1;
+
+                        display_thread_count ++;
+                        chosen_thread = new_thread_id;
+                   }
+                   
+                }
+
+                if(chosen_thread != 0){ //Assigns this alarm to whichever thread we are settled on
+                    alarm->assigned_thread = chosen_thread;
+                    printf("Alarm(%d) Assigned to Display Thread(%lu) at %ld: %s\n", 
+                    alarm->alarm_id, chosen_thread, alarm->request_time, alarm->message);
+                }
+
+            }
+
+            alarm = alarm->link;
+            
+        }
+
+        pthread_mutex_unlock(&alarm_mutex);
+        sleep(1);
+    }
+
+    return NULL;
+}
+
+
 
 /*
  * The alarm thread's start routine.
@@ -95,6 +222,14 @@ void *alarm_thread (void *arg)
          * structure.
          */
         if (alarm != NULL) {
+            // int i;
+
+            for(int i = 0; i < display_thread_count; i++){
+                if(display_threads[i].thread_id == alarm->assigned_thread){
+                    display_threads[i].alarm_count--;
+                    break;
+                }
+            }
             printf ("(%d) %s\n", alarm->seconds, alarm->message);
             free (alarm);
         }
@@ -107,6 +242,12 @@ int main (int argc, char *argv[])
     char line[128];
     alarm_t *alarm, **last, *next;
     pthread_t thread;
+
+    pthread_t start_thread;
+
+    status = pthread_create(&start_thread, NULL, start_alarm_thread, NULL);
+
+
 
     status = pthread_create (
         &thread, NULL, alarm_thread, NULL);
@@ -125,11 +266,44 @@ int main (int argc, char *argv[])
          * (%64[^\n]), consisting of up to 64 characters
          * separated from the seconds by whitespace.
          */
-        if (sscanf (line, "%d %64[^\n]", 
-            &alarm->seconds, alarm->message) < 2) {
-            fprintf (stderr, "Bad command\n");
-            free (alarm);
-        } else {
+
+
+        if(sscanf(line, "Start_Alarm(%d): %d %[^\n]", //Checks for the user imput and depending on what function has been requested, it makes the call for its function
+        &alarm->alarm_id, &alarm->seconds, alarm->message) == 3){
+            alarm->func = ALARM_START;
+            alarm->request_time = time(NULL);
+            printf("Start_Alarm(%d) Request Inserted Into Alarm List: %ld %d %s\n",
+       alarm->alarm_id, alarm->request_time, alarm->seconds, alarm->message);
+
+        } else if(sscanf(line, "Change_Alarm(%d): %d %[^\n]",
+        &alarm->alarm_id, &alarm->seconds, alarm->message) == 3){
+            alarm->func = ALARM_CHANGE;
+            alarm->request_time = time(NULL);
+
+        } else if (sscanf(line, "Cancel_Alarm(%d)", &alarm->alarm_id) == 1){
+            alarm->func = ALARM_CANCEL;
+            alarm->request_time = time(NULL);
+
+        } else if(sscanf(line, "Suspend_Alarm(%d)", &alarm->alarm_id) == 1){
+            alarm->func = ALARM_SUSPEND;
+            alarm->request_time = time(NULL);
+
+        } else if (sscanf(line, "Reactivate_Alarm(%d)", &alarm->alarm_id) == 1){
+            alarm->func = ALARM_REACTIVATE;
+            alarm->request_time = time(NULL);
+
+        } else if(sscanf(line, "View_Alarms", 10) == 0){
+            alarm->func = ALARM_VIEW;
+            alarm->request_time = time(NULL);
+
+        } else{
+            fprintf(stderr, "Bad command\n");
+            free(alarm);
+            continue;
+        }
+        
+        alarm->time = time(NULL) + alarm->seconds;
+
             status = pthread_mutex_lock (&alarm_mutex);
             if (status != 0)
                 err_abort (status, "Lock mutex");
@@ -171,5 +345,4 @@ int main (int argc, char *argv[])
             if (status != 0)
                 err_abort (status, "Unlock mutex");
         }
-    }
 }
